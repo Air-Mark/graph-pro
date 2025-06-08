@@ -1,0 +1,54 @@
+.graph-pro-global-search-input-container {
+    justify-content: left !important;
+}
+
+.graph-pro-title-container {
+    padding-right: 4px !important;
+}
+
+.graph-pro-left-graph-controls {
+    inset-inline-end: unset !important;
+    top: 21px !important;
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 3px !important;
+}
+
+.graph-pro-top-graph-controls {
+    inset-inline-end: unset !important;
+    top: 0 !important;
+    display: flex !important;
+    padding: 0 6px !important;
+}
+
+.graph-pro-input-icon {
+    width: 12px !important;
+    position: absolute !important;
+    margin-left: 6px !important;
+    margin-top: 4px !important;
+    color: var(--search-icon-color) !important;
+}
+
+.graph-pro-toolbar-input {
+    font-size: 10px !important;
+    height: 22px !important;
+    margin: 2px !important;
+    box-shadow: none !important;
+    padding: 4px !important;
+}
+
+.graph-pro-toolbar-input-narrow {
+    width: 30px !important;
+}
+
+.graph-pro-toolbar-input-normal {
+    width: 46px !important;
+}
+
+.graph-pro-toolbar-input-wide {
+    width: 52px !important;
+}
+
+.graph-pro-toolbar-input-with-icon {
+    padding: 2px 2px 2px 20px !important;
+}
