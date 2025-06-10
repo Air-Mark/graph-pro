@@ -142,7 +142,7 @@ module.exports = class GraphPlugin extends Plugin {
                 const fileName = fullPath.split('/').pop();
                 const _key = fileName.replace('.json', '');
                 if (key === _key) {
-                    positionHistory[_key] =  await this.app.vault.readJson(fullPath);
+                    positionHistory[_key] = await this.app.vault.readJson(fullPath);
                 } else {
                     positionHistory[_key] = {};
                 }
@@ -579,6 +579,14 @@ class GraphUI {
         });
         this.addGraphControlsAction(controlsContainer, 'links-going-out', 'Select outgoing links', () => {
             this.graphLeaf.selectOutgoingLinks();
+        });
+
+        const selectNodesWithPositionType = this.addGraphControlsAction(controlsContainer, 'atom', 'Select nodes with position is\nLeft-click: unlocked\nRight-click: locked', () => {
+            this.graphLeaf.selectNodesWithPositionType(false);
+        });
+        selectNodesWithPositionType.addEventListener("contextmenu", async (e) => {
+            e.preventDefault();
+            this.graphLeaf.selectNodesWithPositionType(true);
         });
 
         this.addGraphControlsInput(controlsContainer, 'paint-roller', 'Selection width', 500, 'number', 'wide', "selectionWidth");
@@ -1188,6 +1196,21 @@ class GraphLeaf {
             alphaTarget: 0
         });
         this.addInmemoryHistory();
+    }
+
+    selectNodesWithPositionType(isFixed = true) {
+        const result = [];
+        const inmemoryHistory = this._inmemoryHistory[this._inmemoryHistoryIndex]
+        for (const node of this.renderer.nodes) {
+            if (node) {
+                if (isFixed && node.id in inmemoryHistory) {
+                    result.push(node);
+                } else if (!isFixed && !(node.id in inmemoryHistory)) {
+                    result.push(node);
+                }
+            }
+        }
+        this.onNodesSelected(result);
     }
 
     selectNodesByRegex(regexString) {
