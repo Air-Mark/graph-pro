@@ -1,5 +1,19 @@
 const {Plugin, Setting, Notice, Menu, setTooltip, setIcon, TFile} = require('obsidian');
 
+// Helper for safely patching methods
+const around = (obj, methods) => {
+    const unpatchers = Object.keys(methods).map(key => {
+        const original = obj[key];
+        if (typeof original !== 'function') return;
+
+        obj[key] = methods[key](original);
+
+        return () => { obj[key] = original; };
+    }).filter(Boolean);
+
+    return () => unpatchers.forEach(unpatch => unpatch());
+};
+
 
 const DEFAULT_SETTINGS = {
     showIcons: true,
@@ -52,14 +66,24 @@ module.exports = class GraphPlugin extends Plugin {
             "services/foo.md": "showIcons/foo.png",
         };
         this.imgCache = new Map();
-        this.graphLeaves = new WeakMap();
+        // Use a Map to actively manage GraphLeaf lifecycles
+        this.graphLeaves = new Map();
         this.currentPositionsHistory = {};
+        this.prototypesPatched = false;
         this.registerEvents()
     }
 
     async onload() {
         await this.loadSettings();
         this.preloadIcons();
+    }
+
+    onunload() {
+        // Clean up all GraphLeaf controllers on unload
+        this.graphLeaves.forEach(leafController => {
+            if (leafController.destroy) leafController.destroy();
+        });
+        this.graphLeaves.clear();
     }
 
     registerEvents() {
@@ -69,7 +93,8 @@ module.exports = class GraphPlugin extends Plugin {
         this.registerEvent(
             this.app.workspace.on('active-leaf-change', (leaf) => {
                 if (leaf?.view.getViewType() === 'graph') {
-                    this.setupGraphOnLeaf(leaf);
+                    // It's safer to just re-scan all graphs on any change
+                    this.setupGraphLeafOnAllOpenedGraphs();
                 }
             })
         );
@@ -79,7 +104,26 @@ module.exports = class GraphPlugin extends Plugin {
         });
     }
 
+    // This method now also handles cleanup of controllers for closed graph views
     setupGraphLeafOnAllOpenedGraphs() {
+        const activeRenderers = new Set();
+        this.app.workspace.getLeavesOfType('graph').forEach(leaf => {
+            if (leaf.view?.renderer) {
+                activeRenderers.add(leaf.view.renderer);
+            }
+        });
+
+        // Destroy controllers for closed leaves
+        for (const [renderer, graphLeaf] of this.graphLeaves.entries()) {
+            if (!activeRenderers.has(renderer)) {
+                if (graphLeaf.destroy) {
+                    graphLeaf.destroy();
+                }
+                this.graphLeaves.delete(renderer);
+            }
+        }
+
+        // Setup new leaves
         this.app.workspace.getLeavesOfType('graph').forEach(leaf => {
             this.setupGraphOnLeaf(leaf);
         });
@@ -90,13 +134,45 @@ module.exports = class GraphPlugin extends Plugin {
         const renderer = leaf.view?.renderer;
         if (!renderer) return;
 
-        if (renderer._isPatched || this.graphLeaves.has(renderer)) {
+        if (this.graphLeaves.has(renderer)) {
             return;
         }
 
         const graphLeaf = new GraphLeaf(this, leaf);
         this.graphLeaves.set(renderer, graphLeaf);
         graphLeaf.applyAllPatches();
+    }
+
+    patchPrototypes(AG) {
+        if (this.prototypesPatched) return;
+        this.prototypesPatched = true;
+
+        const pluginInstance = this;
+
+        const unpatch = around(AG.prototype, {
+            initGraphics: (originalInit) => function() {
+                originalInit.apply(this, arguments);
+
+                if (!this._iconSprite) {
+                    const img = pluginInstance.imgCache.get(this.id);
+                    if (img && img.complete && this.renderer?.hanger) {
+                        const sprite = this._iconSprite = PIXI.Sprite.from(img);
+                        sprite.eventMode = 'none';
+                        sprite.texture.orig.width = 250;
+                        sprite.texture.orig.height = 250;
+                        sprite.anchor.set(0.1);
+                        sprite.visible = pluginInstance.settings.showIcons;
+                        this.circle.addChild(sprite);
+                    }
+                }
+                if (this._iconSprite) {
+                    this._iconSprite.visible = pluginInstance.settings.showIcons;
+                }
+            }
+        });
+
+        // Register the unpatcher to be called when the plugin is unloaded
+        this.register(unpatch);
     }
 
     async savePositionHistory(positionHistory) {
@@ -670,12 +746,6 @@ class GraphLeaf {
         this.px = this.renderer.px;
         this.app = this.plugin.app;
 
-        if (this.renderer._isProPatched) {
-            // console.warn("Renderer already patched. Skipping.");
-            this.isApplied = true;
-            return;
-        }
-        this.renderer._isProPatched = true;
         this.isApplied = false;
         this._hoveredNeighborLabels = new Set();
         this.selectedNodes = []
@@ -683,7 +753,16 @@ class GraphLeaf {
         this._inmemoryHistory = [];
         this._inmemoryHistory[0] = this.plugin.getCurrentPositionsHistory();
 
+        // To store unpatch functions for instance-specific patches
+        this.unpatchers = [];
+
         this.ui = new GraphUI(plugin, this);
+    }
+
+    // This method will be called by the plugin to clean up patches
+    destroy() {
+        this.unpatchers.forEach(unpatch => unpatch());
+        this.unpatchers = [];
     }
 
     getNodesPosition() {
@@ -730,6 +809,7 @@ class GraphLeaf {
 
     applyAllPatches() {
         if (this.isApplied) return;
+        this.isApplied = true;
 
         this.setupGrid();
         this.patchRenderer();
@@ -742,20 +822,23 @@ class GraphLeaf {
     }
 
     patchRenderer() {
-        const renderer = this.renderer;
         const self = this;
-        const origSetData = renderer.setData;
-        renderer.setData = function () {
-            const res = origSetData.apply(this, arguments);
-            if (self.plugin.settings.automaticallyRestoreNodePositions) {
-                let positions;
-                if (self._inmemoryHistory.length) {
-                    positions = self._inmemoryHistory[self._inmemoryHistoryIndex];
+        const renderer = this.renderer;
+
+        const unpatch = around(renderer, {
+            setData: (originalSetData) => function(...args) {
+                const res = originalSetData.apply(this, args);
+                if (self.plugin.settings.automaticallyRestoreNodePositions) {
+                    let positions;
+                    if (self._inmemoryHistory.length) {
+                        positions = self._inmemoryHistory[self._inmemoryHistoryIndex];
+                    }
+                    self.restoreNodePositions(positions);
                 }
-                self.restoreNodePositions(positions);
+                return res;
             }
-            return res;
-        }
+        });
+        this.unpatchers.push(unpatch);
     }
 
     patchPixi() {
@@ -824,6 +907,12 @@ class GraphLeaf {
 
         document.body.addEventListener('keydown', onKeyDown);
         document.body.addEventListener('keyup', onKeyUp);
+
+        // Unregister listeners when leaf is destroyed
+        this.unpatchers.push(() => {
+            document.body.removeEventListener('keydown', onKeyDown);
+            document.body.removeEventListener('keyup', onKeyUp);
+        });
 
         // Pointer events for selection
         overlay.on('pointerdown', (e) => {
@@ -1666,11 +1755,11 @@ class GraphLeaf {
                 );
         };
 
-        addTextInput('Label Regex', '(?<label>...)', this.plugin.settings.labelRegex, v => {
+        addTextInput('Label regex', '(?<label>...)', this.plugin.settings.labelRegex, v => {
             this.plugin.settings.labelRegex = v;
         });
 
-        addTextInput('Frontmatter Field', 'e.g. label or title', this.plugin.settings.frontmatterField, v => {
+        addTextInput('Frontmatter field', 'e.g. label or title', this.plugin.settings.frontmatterField, v => {
             this.plugin.settings.frontmatterField = v;
         });
     }
@@ -1716,62 +1805,40 @@ class GraphLeaf {
         if (!Array.isArray(nodes) || !nodes.length) return;
 
         const AG = nodes[0].constructor; // AbstractGraphics
-        if (AG.prototype._isProIconInitPatched) return;
-        AG.prototype._isProIconInitPatched = true;
+        // The patching logic is now in the main plugin class to handle lifecycle correctly.
+        // This method just triggers it once.
+        this.plugin.patchPrototypes(AG);
 
-        const origInit = AG.prototype.initGraphics;
-        const pluginInstance = this.plugin; // Capture plugin instance for use in patched method
-
-        AG.prototype.initGraphics = function () { // `this` here is the node graphics instance
-            origInit.apply(this, arguments);
-
-            if (!this._iconSprite) {
-                const img = pluginInstance.imgCache.get(this.id);
-                if (img && img.complete && this.renderer?.hanger) { // Check renderer.hanger for safety
-                    const sprite = this._iconSprite = PIXI.Sprite.from(img);
-                    sprite.eventMode = 'none';
-                    sprite.texture.orig.width = 250;
-                    sprite.texture.orig.height = 250;
-                    sprite.anchor.set(0.1);
-                    sprite.visible = plugin.settings.showIcons;
-                    this.circle.addChild(sprite);
-                }
-            }
-            if (this._iconSprite) { // Ensure visibility is set according to settings
-                this._iconSprite.visible = pluginInstance.settings.showIcons;
-            }
-        };
         // Force re-initialization for existing nodes if needed, or rely on graph redraw
         this.renderer.setData({nodes: this.renderer.nodes, links: this.renderer.links});
     }
 
     setupHoverLabels() {
-        const origHover = this.renderer.onNodeHover;
-        this.renderer.onNodeHover = (e, nodeId, type) => {
-            origHover.call(this.renderer, e, nodeId, type);
-            this.renderNeighborLabels(nodeId);
-        };
-
-        const origUnhover = this.renderer.onNodeUnhover;
-        this.renderer.onNodeUnhover = e => {
-            origUnhover.call(this.renderer, e);
-            this.clearNeighborLabels();
-        };
-
-        const origPointerDown = this.renderer.onPointerDown;
-        this.renderer.onPointerDown = (e, i) => {
-            origPointerDown.call(this.renderer, e, i);
-            if (this.renderer.dragNode) {
-                this.renderer._dragNode = this.renderer.dragNode;
-                this.renderer._dragStart = {
-                    x: this.renderer.dragNode.x,
-                    y: this.renderer.dragNode.y
-                };
-            } else {
-                delete this.renderer._dragNode;
-                delete this.renderer._dragStart;
+        const unpatch = around(this.renderer, {
+            onNodeHover: (originalHover) => (e, nodeId, type) => {
+                originalHover.call(this.renderer, e, nodeId, type);
+                this.renderNeighborLabels(nodeId);
+            },
+            onNodeUnhover: (originalUnhover) => (e) => {
+                originalUnhover.call(this.renderer, e);
+                this.clearNeighborLabels();
+            },
+            onPointerDown: (originalPointerDown) => (e, i) => {
+                originalPointerDown.call(this.renderer, e, i);
+                if (this.renderer.dragNode) {
+                    this.renderer._dragNode = this.renderer.dragNode;
+                    this.renderer._dragStart = {
+                        x: this.renderer.dragNode.x,
+                        y: this.renderer.dragNode.y
+                    };
+                } else {
+                    delete this.renderer._dragNode;
+                    delete this.renderer._dragStart;
+                }
             }
-        };
+        });
+        this.unpatchers.push(unpatch);
+
 
         this.renderer.px.stage.on("pointerup", () => {
             const dragNodeBeforeUp = this.renderer._dragNode;
@@ -1829,10 +1896,14 @@ class GraphLeaf {
             let name = nid.substring(nid.lastIndexOf('/') + 1).replace(/\.md$/, '');
 
             if (this.plugin.settings.frontmatterField) {
-                const frontmatter = this.getNodeFrontmatter(nid);
-                const fmField = this.plugin.settings.frontmatterField;
-                if (frontmatter && frontmatter[fmField] != null) {
-                    name = String(cache.frontmatter[fmField]);
+                const file = this.app.vault.getAbstractFileByPath(nid);
+                if (file) {
+                    const cache = this.app.metadataCache.getFileCache(file);
+                    const frontmatter = this.getNodeFrontmatter(nid);
+                    const fmField = this.plugin.settings.frontmatterField;
+                    if (frontmatter && frontmatter[fmField] != null) {
+                        name = String(cache.frontmatter[fmField]);
+                    }
                 }
             } else if (this.plugin.settings.labelRegex) {
                 try {
